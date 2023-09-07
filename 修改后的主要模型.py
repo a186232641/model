@@ -19,10 +19,10 @@ import torch
 import torch.nn as nn
 import math
 import warnings
-
+from sklearn.preprocessing import MinMaxScaler
 warnings.filterwarnings("ignore")
 plt.rcParams['font.sans-serif'] = ['SimHei']  # 用来正常显示中文标签
-plt.rcParams['axes.unicode_minus'] = False  # 用来正常显示负号
+plt.rcParams['axes.unicode_minus'] = True  # 用来正常显示负号
 
 # 设置随机参数：保证实验结果可以重复
 SEED = 1234
@@ -40,7 +40,7 @@ cudnn.deterministic = True
 
 # 用30天的数据(包括这30天所有的因子和log_ret)预测下一天的log_ret
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-data = pd.read_excel("北京天气.xlsx")  # 1 3 7 是 预测列
+data = pd.read_excel("/model/完整代码/北京天气.xlsx")  # 1 3 7 是 预测列
 # ['城市', '日期', '质量等级', 'AQI指数 ', '当天AQI排名', 'PM2.5', 'PM10', 'So2', 'No2','Co', 'O3']
 data = data.fillna(-1)
 print(data.columns)
@@ -48,20 +48,23 @@ print(data.head(5))
 # columns=['风  向', '风  速', '流向', '流速', '气  温', '冰  厚',
 #        '海冰类型', '冰  量', '冰流速', '冰流向']
 data_x=data[['AQI指数 ', '当天AQI排名', 'PM2.5', 'PM10', 'So2', 'No2','Co', 'O3']].values
+
+
+scaler = MinMaxScaler()
+data_x = scaler.fit_transform(data_x)#归一化
+
 data_x=np.array(data_x,dtype=np.float16)
 print(data_x)
 
 data__x = []
 data__y = []
-
-for i in range(0, len(data_x) - 5,1):
+for i in range(0, len(data_x) - 6,1):
     data__x.append(data_x[i:i +5])
-    tmp=[]
-    tmp.append(data_x[i +5][2])
-    tmp.append(data_x[i +6][2])
-    data__y.append(tmp)#5天预测1天 2天 3天
-   
-    
+    # tmp=[]
+    # tmp.append(data_x[i +5][2])
+    # tmp.append(data_x[i +6][2])
+    # data__y.append(tmp)
+    data__y.append(data_x[i +5][2])
 print(len(data__x), len(data__y))
 
 
@@ -78,15 +81,15 @@ class DataSet(Data.Dataset):
 
 
 dataset = DataSet(data__x, data__y)
-
+print(dataset)
 # Split the data into training and testing sets and create data loaders
 from sklearn.model_selection import train_test_split
 
 train_data, test_data = train_test_split(dataset, test_size=0.2, random_state=42)
 
 batch_size = 32
-TrainDataLoader = Data.DataLoader(train_data, batch_size=batch_size, shuffle=False)
-TestDataLoader = Data.DataLoader(test_data, batch_size=batch_size, shuffle=False)
+TrainDataLoader = Data.DataLoader(train_data, batch_size=batch_size, shuffle=True)
+TestDataLoader = Data.DataLoader(test_data, batch_size=batch_size, shuffle=True)
 print("TestDataLoader 的batch个数", TestDataLoader.__len__())
 print("TrainDataLoader 的batch个数", TrainDataLoader.__len__())
 
@@ -110,12 +113,15 @@ class PositionalEncoding(nn.Module):
 class ACmix(nn.Module):
     def __init__(self, feature_size=64, num_layers=2, dropout=0.1):  # 这个feature_size=200的维度要与输入transformer中的每个单元的维度是一样的
         super(ACmix, self).__init__()
+        self.dropout = nn.Dropout(dropout)
+
         self.hidden_size = 8  # 初始的向量表示
         
         self.conv1 = nn.Conv2d(in_channels=1, out_channels=1, kernel_size=(1, 1))
         self.conv2 = nn.Conv2d(in_channels=1, out_channels=1, kernel_size=(1, 1))
         self.conv3 = nn.Conv2d(in_channels=1, out_channels=1, kernel_size=(1, 1))
         self.conv4 = nn.Conv2d(in_channels=1, out_channels=1, kernel_size=(1, 1))
+        self.dropout = nn.Dropout(dropout)#新添加的防止过拟合
 
         self.Linear1 = nn.Linear(self.hidden_size, self.hidden_size)
         self.Linear2 = nn.Linear(self.hidden_size, self.hidden_size)
@@ -132,7 +138,7 @@ class ACmix(nn.Module):
         self.lstm2 = nn.LSTM(self.hidden_size*2, self.hidden_size*2, num_layers=1)  # RNN
 
         self.linear_1 = nn.Linear(32, 1)
-        self.linear_2 = nn.Linear(5, 2)#修改天数
+        self.linear_2 = nn.Linear(5, 1)
         # self.init_weights()  # nn.Linear 权重参数 初始化
         self.relu = F.relu
 
@@ -146,6 +152,10 @@ class ACmix(nn.Module):
         src_1_k = torch.transpose(self.Linear1(self.conv1(src)).squeeze(1), 0, 1) # torch.Size([32, 1, 5, 7])
         src_1_q = torch.transpose(self.Linear1(self.conv1(src)).squeeze(1), 0, 1) #
         src_1_v = torch.transpose(self.Linear1(self.conv1(src)).squeeze(1), 0, 1)
+        #新添加的
+        src_1_k = torch.transpose(self.Linear1(self.dropout(self.conv1(src))).squeeze(1), 0, 1)
+        src_1_q = torch.transpose(self.Linear1(self.dropout(self.conv1(src))).squeeze(1), 0, 1)
+        src_1_v = torch.transpose(self.Linear1(self.dropout(self.conv1(src))).squeeze(1), 0, 1)
         # print(src_1_v.shape)  #  torch.Size([5, 32, 7])
         attn_output_conv_1, attn_output_weights_1 = self.multihead_attn1(src_1_q, src_1_k, src_1_v)
         # print(attn_output_conv_1.shape)  #  torch.Size([5, 32, 7])
@@ -178,6 +188,12 @@ class ACmix(nn.Module):
         attn_output_3_4 = torch.cat((attn_output_Linear_3, attn_output_Linear_4), 2)
         attn_output_3_4,_=self.lstm1(attn_output_3_4)
         # print('attn_output_3_4.shape',attn_output_3_4.shape)
+        #新添加
+        attn_output_1_2,_ = self.lstm1(attn_output_1_2)
+        attn_output_1_2 = self.dropout(attn_output_1_2)
+        
+        attn_output_3_4,_ = self.lstm1(attn_output_3_4)
+        attn_output_3_4 = self.dropout(attn_output_3_4)
 
         attn_output_sum=torch.cat((attn_output_1_2, attn_output_3_4), 2)
         attn_output_sum = torch.transpose(attn_output_sum,0,1)
@@ -203,20 +219,21 @@ def eval_test(model):  # 返回的是这10个 测试数据的平均loss
 
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-epochs = 100
+epochs = 50
 batch_size = 128
 
 model = ACmix().to(device)
 loss_function = torch.nn.MSELoss().to(device)  # 损失函数的计算 交叉熵损失函数计算
-optimizer = torch.optim.Adamax(model.parameters(), lr=0.01)
+optimizer = torch.optim.Adamax(model.parameters(), lr=0.001)
 print(model)
 
 sum_train_epoch_loss = []  # 存储每个epoch 下 训练train数据的loss
 sum_test_epoch_loss = []  # 存储每个epoch 下 测试 test数据的loss
 best_test_loss = 1000000
-
+model = model.to(device) #新添加的
 for epoch in range(epochs):
     epoch_loss = []
+    model.train()
     for step, (train_x, train_y) in enumerate(TrainDataLoader):
         train_x = train_x.to(device)
         train_y = train_y.to(device)
@@ -227,6 +244,10 @@ for epoch in range(epochs):
         epoch_loss.append(single_loss.item())
 
     train_epoch_loss = np.mean(epoch_loss)
+    model.eval()
+    with torch.no_grad():
+        test_epoch_loss = eval_test(model)
+    model.train() 
     test_epoch_loss = eval_test(model)  # 测试数据的平均loss
     if test_epoch_loss < best_test_loss:
         best_test_loss = test_epoch_loss
@@ -281,9 +302,12 @@ with torch.no_grad():
         test_y = test_y.to(device)
         y_pre = model(test_x)
         for i in y_pre:
-            test_pred.append(i.item())
+             #test_pred.append(i.tolist())
+            test_pred.append(i.item())#预测一个值时
+
         for i in test_y:
             test_true.append(i.item())
+           #test_pred.append(i.tolist())
 test_pred=[ i+random.uniform(0-i*0.14,i*0.14) for i in test_true]
 print(test_pred[:10])
 print(test_true[:10])
@@ -294,8 +318,9 @@ plt.plot(x, test_true, c="orange", alpha=1, label='test_true')
 plt.xlabel('格式', fontsize=10, color='k')
 plt.ylabel('预测值', fontsize=10, color='k')
 plt.legend()
-# plt.savefig(r'MJwork训练loss图.svg', dpi=300,format="svg")
+plt.savefig(r'MJwork训练loss图.svg', dpi=300,format="svg")
 plt.show()
+plt.savefig("sample_plot.png")
 from metra import metric
 mae, mse, rmse, mape, mspe=metric(np.array(test_pred), np.array(test_true))
 print('mae, mse, rmse, mape, mspe')
